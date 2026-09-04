@@ -1,0 +1,264 @@
+// ======================================================
+// FULL GEE CODE
+// Annual predictor stacks harmonized to PfPR2-10 scale
+// Study area: Karagwe District, Tanzania
+// Years: 2020–2024
+// Output: 5 km predictor stacks
+// ======================================================
+
+
+// ===============================
+// 1. Study Area
+// ===============================
+var districts = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level2");
+
+var aoi = districts.filter(ee.Filter.eq("ADM2_NAME", "Karagwe"));
+
+Map.centerObject(aoi, 9);
+Map.addLayer(aoi, {color: "red"}, "Karagwe District");
+
+
+// ===============================
+// 2. Common Projection and Scale
+// ===============================
+// PfPR2-10 is approximately 5 km.
+// EPSG:4326 is used because MAP PfPR products are commonly geographic.
+var commonCRS = "EPSG:4326";
+var fineScale = 30;
+var pfprScale = 5000;
+
+var commonProjection = ee.Projection(commonCRS).atScale(fineScale);
+
+
+// ===============================
+// 3. Sentinel-2 Cloud Mask
+// ===============================
+function maskS2clouds(image) {
+  var qa = image.select("QA60");
+
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask)
+    .divide(10000)
+    .copyProperties(image, ["system:time_start"]);
+}
+
+
+// ===============================
+// 4. Annual Predictor Stack Function
+// ===============================
+function createAnnualStack(year) {
+
+  year = ee.Number(year);
+
+  var start = ee.Date.fromYMD(year, 1, 1);
+
+  // Correct full-year end date.
+  // GEE filterDate uses the end date as exclusive.
+  var end = ee.Date.fromYMD(year.add(1), 1, 1);
+
+
+  // -------------------------------
+  // Sentinel-2 spectral indices
+  // -------------------------------
+  var s2Collection = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(aoi)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
+    .map(maskS2clouds);
+
+  var s2 = s2Collection.median().clip(aoi);
+
+  var ndvi = s2.normalizedDifference(["B8", "B4"]).rename("NDVI");
+  var ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI");
+  var ndmi = s2.normalizedDifference(["B8", "B11"]).rename("NDMI");
+  var ndbi = s2.normalizedDifference(["B11", "B8"]).rename("NDBI");
+  var mndwi = s2.normalizedDifference(["B3", "B11"]).rename("MNDWI");
+
+
+  // -------------------------------
+  // MODIS LST annual mean in °C
+  // -------------------------------
+  var lst = ee.ImageCollection("MODIS/061/MOD11A1")
+    .filterBounds(aoi)
+    .filterDate(start, end)
+    .select("LST_Day_1km")
+    .mean()
+    .multiply(0.02)
+    .subtract(273.15)
+    .rename("LST")
+    .clip(aoi);
+
+
+  // -------------------------------
+  // CHIRPS annual rainfall total
+  // -------------------------------
+  var rainfall = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+    .filterBounds(aoi)
+    .filterDate(start, end)
+    .select("precipitation")
+    .sum()
+    .rename("Rainfall")
+    .clip(aoi);
+
+
+  // -------------------------------
+  // SRTM elevation and slope
+  // -------------------------------
+  var dem = ee.Image("USGS/SRTMGL1_003")
+    .select("elevation")
+    .clip(aoi);
+
+  var elevation = dem.rename("Elevation");
+  var slope = ee.Terrain.slope(dem).rename("Slope");
+
+
+  // -------------------------------
+  // Distance to permanent water
+  // -------------------------------
+  // -------------------------------
+  // Distance to permanent water (Metres)
+  // -------------------------------
+  var water = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
+    .select("occurrence")
+    .gte(50)
+    .clip(aoi)
+    .unmask(0); // Ensure dry land is 0, not masked, so distance can be calculated
+
+  var distWater = water
+    // Explicitly run the transform at the 30m common projection geometry
+    .fastDistanceTransform(30, "pixels", "squared_euclidean")
+    .sqrt()
+    .multiply(30) // Now reliably scales to approximate metres
+    .rename("DistWater")
+    .clip(aoi);
+
+
+  // -------------------------------
+  // Stack for mean aggregation
+  // Continuous environmental variables
+  // -------------------------------
+  var meanStack = ee.Image.cat([
+    ndvi,
+    ndwi,
+    ndmi,
+    ndbi,
+    mndwi,
+    lst,
+    rainfall,
+    elevation,
+    slope
+  ])
+  .toFloat()
+  .clip(aoi)
+  .setDefaultProjection(commonProjection);
+
+
+  // -------------------------------
+  // Aggregate continuous variables to 5 km using mean
+  // -------------------------------
+  var meanStack5km = meanStack
+    .reduceResolution({
+      reducer: ee.Reducer.mean(),
+      maxPixels: 65535
+    })
+    .reproject({
+      crs: commonCRS,
+      scale: pfprScale
+    })
+    .clip(aoi);
+
+
+  // -------------------------------
+  // Aggregate distance-to-water to 5 km using minimum
+  // This preserves nearest-water influence.
+  // -------------------------------
+  var distWater5km = distWater
+    .toFloat()
+    .setDefaultProjection(commonProjection)
+    .reduceResolution({
+      reducer: ee.Reducer.min(),
+      maxPixels: 65535
+    })
+    .reproject({
+      crs: commonCRS,
+      scale: pfprScale
+    })
+    .rename("DistWater")
+    .clip(aoi);
+
+
+  // -------------------------------
+  // Final 10-band predictor stack
+  // -------------------------------
+  var stack5km = meanStack5km
+    .addBands(distWater5km)
+    .toFloat()
+    .set("year", year)
+    .set("scale_m", pfprScale)
+    .set("crs", commonCRS);
+
+  return stack5km;
+}
+
+
+// ===============================
+// 5. Create and Export Stacks
+// ===============================
+var years = [2020, 2021, 2022, 2023, 2024];
+
+years.forEach(function(year) {
+
+  var annualStack5km = createAnnualStack(year);
+
+  // Preview NDVI
+  Map.addLayer(
+    annualStack5km.select("NDVI"),
+    {min: 0, max: 1},
+    "NDVI 5km " + year,
+    false
+  );
+
+  // Preview rainfall
+  Map.addLayer(
+    annualStack5km.select("Rainfall"),
+    {min: 500, max: 2000},
+    "Rainfall 5km " + year,
+    false
+  );
+
+  // Preview distance to water
+  Map.addLayer(
+    annualStack5km.select("DistWater"),
+    {min: 0, max: 10000},
+    "Minimum DistWater 5km " + year,
+    false
+  );
+
+  // Export full 10-band stack
+  Export.image.toDrive({
+    image: annualStack5km,
+    description: "Karagwe_Predictor_Stack" + year,
+    folder: "PfPR_Predictors",
+    fileNamePrefix: "Karagwe_Predictor_Stack" + year,
+    region: aoi.geometry(),
+    scale: pfprScale,
+    crs: commonCRS,
+    maxPixels: 1e13
+  });
+
+});
+
+
+// ===============================
+// 6. Print Checks
+// ===============================
+var checkStack = createAnnualStack(2020);
+
+print("Band names:", checkStack.bandNames());
+print("Example 2020 stack:", checkStack);
+print("Projection:", checkStack.projection());
